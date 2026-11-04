@@ -2041,6 +2041,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     {
         return size.width
     }
+
+    func getEffectiveHeight (size: CGSize) -> CGFloat
+    {
+        return size.height
+    }
     
     func updateDebugDisplay ()
     {
