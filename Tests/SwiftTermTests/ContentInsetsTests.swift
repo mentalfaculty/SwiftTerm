@@ -288,6 +288,58 @@ struct ContentInsetsTests {
         #expect(shadeAt(x: 50, yFromTop: top - 1, in: image) == .green)
     }
 
+    /// A 37 point top inset is not a whole number of rows: two scrollback
+    /// rows show, the upper one cut off at the top edge.
+    @Test func coreGraphicsShowsAPartRowAtTheTopEdge() throws {
+        let view = try makePixelView()
+        let cell = view.cellDimension!
+        let top: CGFloat = 37
+        #expect(top.truncatingRemainder(dividingBy: cell.height) != 0)
+        view.contentInsets = NSEdgeInsets(top: top, left: 0, bottom: 0, right: 0)
+        // Red on screen row 0, green on the two scrollback rows above it.
+        let rows = view.withTerminal { $0.rows }
+        let count = rows + 10
+        let firstVisible = count + 1 - rows
+        var text = ""
+        for line in 0..<count {
+            if line == firstVisible - 1 || line == firstVisible - 2 {
+                text += Self.coloredLine(42)
+            } else if line == firstVisible {
+                text += Self.coloredLine(41)
+            } else {
+                text += "\r\n"
+            }
+        }
+        view.feed(text: text)
+        let image = coreGraphicsPixels(view)
+        #expect(shadeAt(x: 50, yFromTop: top + 2, in: image) == .red)
+        #expect(shadeAt(x: 50, yFromTop: top - 2, in: image) == .green)
+        if top > 2 * cell.height {
+            // A third row would show at the edge; it is plain.
+            #expect(shadeAt(x: 50, yFromTop: 1, in: image) == .background)
+        } else {
+            // The second row up reaches the edge, cut off there.
+            #expect(shadeAt(x: 50, yFromTop: 1, in: image) == .green)
+        }
+    }
+
+    /// Clearing the scrollback (CSI 3J) on its own repaints the top inset.
+    @Test func clearingScrollbackRedrawsTheTopInset() throws {
+        let view = try makePixelView()
+        view.contentInsets = NSEdgeInsets(top: 30, left: 0, bottom: 0, right: 0)
+        Self.feedScrollback(view)
+        if let state = view.captureFrameViewState() {
+            _ = view.prepareFrame(viewState: state)
+        }
+        view.feed(text: "\u{1b}[3J")
+        let state = try #require(view.captureFrameViewState())
+        let region = try #require(view.prepareFrame(viewState: state)?.region)
+        #expect(region.maxY >= view.bounds.height)
+        let cell = view.cellDimension!
+        let image = coreGraphicsPixels(view)
+        #expect(shadeAt(x: 50, yFromTop: 30 - cell.height / 2, in: image) == .background)
+    }
+
     @Test func coreGraphicsLeavesTheBottomInsetEmpty() throws {
         let view = try makePixelView()
         view.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 20, right: 0)

@@ -1484,6 +1484,8 @@ final class MetalTerminalRenderer {
         // the frame by the view's content insets: right by the left inset and
         // down (Metal's y points up here) by the top inset.
         let insets = renderContext.contentInsets
+        // `renderingScale` can differ from the backing scale the insets were
+        // rounded with only under `metalScaleFactorOverride`.
         let viewport = SIMD4<Float>(Float(drawableSize.width), Float(drawableSize.height),
                                     Float(round(insets.left * renderContext.renderingScale)),
                                     -Float(round(insets.top * renderContext.renderingScale)))
