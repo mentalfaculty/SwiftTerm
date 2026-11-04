@@ -4772,6 +4772,10 @@ open class Terminal {
                 buffer.linesTop = 0
                 buffer.yBase = max (buffer.yBase - scrollBackSize, 0)
                 buffer.yDisp = max (buffer.yDisp - scrollBackSize, 0)
+                // Nothing on the screen changed, but a view that shows
+                // scrollback above row 0 (the Mac view's top content inset)
+                // or is scrolled back must repaint.
+                updateRange (0)
             }
             break;
         default:
