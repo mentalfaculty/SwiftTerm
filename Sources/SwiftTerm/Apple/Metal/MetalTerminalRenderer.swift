@@ -599,6 +599,18 @@ struct KittyImageSignature: Hashable {
     let headHash: UInt32
 }
 
+/// The vertex shaders' `Viewport` (Shaders.metal): drawable size and inset
+/// offset and the top inset fade, in pixels, then the default background.
+/// Its layout must match the shaders'. A change to it also needs a new
+/// shader function name in `requiredShaderFunctions`, so that an app's stale
+/// default library is not used with the new layout.
+struct MetalViewport {
+    var geometry: SIMD4<Float>
+    var fade: SIMD4<Float>
+    /// The premultiplied default background.
+    var background: SIMD4<Float>
+}
+
 struct ClipRect {
     let minX: Float
     let minY: Float
@@ -1283,7 +1295,7 @@ final class MetalTerminalRenderer {
                                                                                           library: library,
                                                                                           pixelFormat: pixelFormat,
                                                                                           vertexName: "terminal_cell_color_vertex",
-                                                                                          fragmentName: "terminal_color_fragment",
+                                                                                          fragmentName: "terminal_color_fragment_premultiplied",
                                                                                           blending: false) else {
             throw MetalError.pipelineCreationFailed("text/color/cell")
         }
@@ -1484,11 +1496,17 @@ final class MetalTerminalRenderer {
         // the frame by the view's content insets: right by the left inset and
         // down (Metal's y points up here) by the top inset.
         let insets = renderContext.contentInsets
+        let fade = renderContext.topInsetFade
         // `renderingScale` can differ from the backing scale the insets were
         // rounded with only under `metalScaleFactorOverride`.
-        let viewport = SIMD4<Float>(Float(drawableSize.width), Float(drawableSize.height),
-                                    Float(round(insets.left * renderContext.renderingScale)),
-                                    -Float(round(insets.top * renderContext.renderingScale)))
+        let topPx = round(insets.top * scale)
+        let viewport = MetalViewport(
+            geometry: SIMD4<Float>(Float(drawableSize.width), Float(drawableSize.height),
+                                   Float(round(insets.left * scale)), -Float(topPx)),
+            fade: SIMD4<Float>(Float(fade.alpha), Float(topPx),
+                               Float(round(min(fade.length, insets.top) * scale)), 0),
+            background: SIMD4<Float>(bgColor.x * bgColor.w, bgColor.y * bgColor.w,
+                                     bgColor.z * bgColor.w, bgColor.w))
 
         let backgroundPipeline = renderContext.translucentCellBackgroundAlpha == nil
             ? cellColorPipeline : cellBackgroundReplacePipeline
@@ -1566,7 +1584,7 @@ final class MetalTerminalRenderer {
                 encoder.setRenderPipelineState(colorPipeline)
                 encoder.setVertexBuffer(buffer, offset: 0, index: 0)
                 var viewportVar = viewport
-                encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+                encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: drawData.cursorColorVertices.count)
             }
         }
@@ -1576,7 +1594,7 @@ final class MetalTerminalRenderer {
                 encoder.setRenderPipelineState(textGrayPipeline)
                 encoder.setVertexBuffer(buffer, offset: 0, index: 0)
                 var viewportVar = viewport
-                encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+                encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
                 encoder.setFragmentTexture(grayscaleAtlas.texture, index: 0)
                 encoder.setFragmentSamplerState(sampler, index: 0)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: drawData.cursorGlyphVerticesGray.count)
@@ -1588,7 +1606,7 @@ final class MetalTerminalRenderer {
                 encoder.setRenderPipelineState(textPipeline)
                 encoder.setVertexBuffer(buffer, offset: 0, index: 0)
                 var viewportVar = viewport
-                encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+                encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
                 encoder.setFragmentTexture(colorAtlas.texture, index: 0)
                 encoder.setFragmentSamplerState(sampler, index: 0)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: drawData.cursorGlyphVerticesColor.count)
@@ -3801,14 +3819,14 @@ final class MetalTerminalRenderer {
                                    pipeline: MTLRenderPipelineState,
                                    texture: MTLTexture?,
                                    encoder: MTLRenderCommandEncoder,
-                                   viewport: SIMD4<Float>) {
+                                   viewport: MetalViewport) {
         guard !cells.isEmpty, let buffer = makeBuffer(cells) else {
             return
         }
         encoder.setRenderPipelineState(pipeline)
         encoder.setVertexBuffer(buffer, offset: 0, index: 0)
         var viewportVar = viewport
-        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
         if let texture {
             encoder.setFragmentTexture(texture, index: 0)
             encoder.setFragmentSamplerState(sampler, index: 0)
@@ -3817,7 +3835,7 @@ final class MetalTerminalRenderer {
     }
 
     private func drawFrameData(_ frame: FrameDrawData, backgroundPipeline: MTLRenderPipelineState,
-                               encoder: MTLRenderCommandEncoder, viewport: SIMD4<Float>) {
+                               encoder: MTLRenderCommandEncoder, viewport: MetalViewport) {
         drawImageBatches(frame.belowBackgroundImageDraws, encoder: encoder, viewport: viewport)
 
         drawCellBuffer(frame.backgroundCells,
@@ -3857,14 +3875,14 @@ final class MetalTerminalRenderer {
         drawImageBatches(frame.otherImageDraws, encoder: encoder, viewport: viewport)
     }
 
-    private func drawImageBatches(_ draws: [ImageDraw], encoder: MTLRenderCommandEncoder, viewport: SIMD4<Float>) {
+    private func drawImageBatches(_ draws: [ImageDraw], encoder: MTLRenderCommandEncoder, viewport: MetalViewport) {
         guard !draws.isEmpty else {
             return
         }
         encoder.setRenderPipelineState(textPipeline)
         encoder.setFragmentSamplerState(sampler, index: 0)
         var viewportVar = viewport
-        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
         for draw in draws {
             guard let buffer = makeBuffer(draw.vertices) else {
                 continue
@@ -3881,7 +3899,7 @@ final class MetalTerminalRenderer {
                                    pipeline: MTLRenderPipelineState,
                                    texture: MTLTexture?,
                                    encoder: MTLRenderCommandEncoder,
-                                   viewport: SIMD4<Float>) {
+                                   viewport: MetalViewport) {
         var hasAny = false
         for row in rows {
             if row[keyPath: bufferKey] != nil {
@@ -3894,7 +3912,7 @@ final class MetalTerminalRenderer {
         }
         encoder.setRenderPipelineState(pipeline)
         var viewportVar = viewport
-        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
         if let texture {
             encoder.setFragmentTexture(texture, index: 0)
             encoder.setFragmentSamplerState(sampler, index: 0)
@@ -3915,7 +3933,7 @@ final class MetalTerminalRenderer {
     private func drawImageRows(rows: [RowDrawBuffers],
                                imageKey: KeyPath<RowDrawBuffers, [ImageDrawBuffer]>,
                                encoder: MTLRenderCommandEncoder,
-                               viewport: SIMD4<Float>) {
+                               viewport: MetalViewport) {
         var hasAny = false
         for row in rows {
             if !row[keyPath: imageKey].isEmpty {
@@ -3929,7 +3947,7 @@ final class MetalTerminalRenderer {
         encoder.setRenderPipelineState(textPipeline)
         encoder.setFragmentSamplerState(sampler, index: 0)
         var viewportVar = viewport
-        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+        encoder.setVertexBytes(&viewportVar, length: MemoryLayout<MetalViewport>.stride, index: 1)
         for row in rows {
             for draw in row[keyPath: imageKey] {
                 encoder.setVertexBuffer(draw.buffer, offset: 0, index: 0)
@@ -4767,7 +4785,8 @@ final class MetalTerminalRenderer {
             "terminal_text_fragment_gray",
             "terminal_color_vertex",
             "terminal_cell_color_vertex",
-            "terminal_color_fragment"
+            "terminal_color_fragment",
+            "terminal_color_fragment_premultiplied"
         ]
     }
 
