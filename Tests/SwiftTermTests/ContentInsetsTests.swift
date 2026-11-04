@@ -362,6 +362,166 @@ struct ContentInsetsTests {
         #expect(shadeAt(x: 50, yFromTop: cell.height / 2, in: image) == .red)
         #expect(shadeAt(x: 50, yFromTop: 1, in: image) == .red)
     }
+
+    // MARK: - Top inset fade
+
+    /// Every line, scrollback and screen, carries the same white text.
+    static let textLine = String(repeating: "M", count: 20)
+
+    static func feedText(_ view: TerminalView) {
+        let rows = view.withTerminal { $0.rows }
+        view.feed(text: String(repeating: textLine + "\r\n", count: rows + 10))
+    }
+
+    /// The summed ink of one channel over the pixel rows between `from` and
+    /// `to` points below the top edge.
+    static func ink(_ pixels: [UInt8], width: Int, scale: CGFloat, channel: Int,
+                    from: CGFloat, to: CGFloat) -> Int {
+        var total = 0
+        let first = max(0, Int((from * scale).rounded()))
+        let last = min(pixels.count / (width * 4), Int((to * scale).rounded()))
+        for y in first..<last {
+            for x in 0..<width {
+                total += Int(pixels[(y * width + x) * 4 + channel])
+            }
+        }
+        return total
+    }
+
+    static let fadeTop: CGFloat = 32
+
+    static func fadedView(alpha: CGFloat, fade: CGFloat) throws -> TerminalView {
+        let font = try #require(NSFont(name: "Monaco", size: 12))
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 200, height: 160), font: font)
+        view.nativeBackgroundColor = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
+        view.nativeForegroundColor = .white
+        view.contentInsets = NSEdgeInsets(top: fadeTop, left: 0, bottom: 0, right: 0)
+        view.topInsetContentAlpha = alpha
+        view.topInsetFadeLength = fade
+        return view
+    }
+
+    @Test func fadeDefaultsDrawExactlyAsBefore() throws {
+        let plain = try Self.fadedView(alpha: 1, fade: 0)
+        let unused = try Self.fadedView(alpha: 1, fade: 6)
+        #expect(plain.topInsetContentAlpha == 1 && plain.topInsetFadeLength == 0)
+        #expect(plain.frameTopInsetFade.isIdentity)
+        let fresh = try makePixelView()
+        fresh.contentInsets = NSEdgeInsets(top: Self.fadeTop, left: 0, bottom: 0, right: 0)
+        for view in [plain, unused, fresh] {
+            Self.feedText(view)
+        }
+        let reference = coreGraphicsPixels(fresh).pixels
+        #expect(coreGraphicsPixels(plain).pixels == reference)
+        #expect(coreGraphicsPixels(unused).pixels == reference)
+    }
+
+    /// Red cell backgrounds on every line: one pixel row at a time, the
+    /// opacity follows the ramp (pixel centers, so 2.5 points above row 0 is
+    /// 1 - 0.5 * 2.5 / 6).
+    static func feedRed(_ view: TerminalView) {
+        let rows = view.withTerminal { $0.rows }
+        view.feed(text: String(repeating: coloredLine(41), count: rows + 10))
+    }
+
+    static func expectedFadeRed(full: Double, above: CGFloat) -> Double {
+        full * Double(FrameTopInsetFade(alpha: 0.5, length: 6).opacity(above: above))
+    }
+
+    @Test func coreGraphicsFadeRampsPerPixelRow() throws {
+        let view = try Self.fadedView(alpha: 0.5, fade: 6)
+        Self.feedRed(view)
+        let image = coreGraphicsPixels(view)
+        func red(_ y: Int) -> Double { Double(image.pixels[(y * image.width + 50) * 4]) }
+        let full = red(Int(Self.fadeTop) + 2)
+        #expect(full > 150)
+        for y in [2, 20, 26, 28, 29, 31] {
+            let above = Self.fadeTop - (CGFloat(y) + 0.5)
+            let expected = Self.expectedFadeRed(full: full, above: above)
+            #expect(abs(red(y) - expected) <= 4, "y \(y): \(red(y)) vs \(expected)")
+        }
+    }
+
+    /// Setting the alpha after a frame was drawn shows in the next draw,
+    /// with no new output and no frame prepared in between.
+    @Test func coreGraphicsShowsAnAlphaSetAfterADraw() throws {
+        let view = try Self.fadedView(alpha: 1, fade: 0)
+        Self.feedRed(view)
+        let before = coreGraphicsPixels(view)
+        view.topInsetContentAlpha = 0.5
+        let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+        view.cacheDisplay(in: view.bounds, to: rep)
+        var pixels = [UInt8](repeating: 0, count: before.width * Int(view.bounds.height) * 4)
+        pixels.withUnsafeMutableBytes { storage in
+            let context = CGContext(data: storage.baseAddress, width: before.width,
+                                    height: Int(view.bounds.height), bitsPerComponent: 8,
+                                    bytesPerRow: before.width * 4,
+                                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            let bounds = CGRect(origin: .zero, size: view.bounds.size)
+            if let background = view.layer?.backgroundColor {
+                context.setFillColor(background)
+                context.fill(bounds)
+            }
+            context.draw(rep.cgImage!, in: bounds)
+        }
+        let full = Double(before.pixels[(2 * before.width + 50) * 4])
+        let faded = Double(pixels[(2 * before.width + 50) * 4])
+        #expect(full > 150)
+        #expect(abs(faded - full * 0.5) <= 4, "\(faded) vs \(full)")
+    }
+
+    /// With translucent cell backgrounds a faded cell mixes back towards the
+    /// default background, as it does over an opaque one; it does not punch
+    /// a hole through it.
+    @Test func coreGraphicsFadesTranslucentCellBackgroundsTowardsTheDefault() throws {
+        let view = try Self.fadedView(alpha: 0.5, fade: 6)
+        view.backgroundOpacity = 0.4
+        view.translucentCellBackgrounds = true
+        Self.feedRed(view)
+        let image = coreGraphicsPixels(view)
+        let inset = Array(image.pixels[((2 * image.width) + 50) * 4..<((2 * image.width) + 50) * 4 + 4])
+        // Red at 0.4 replaced the default black at 0.4: half of it is left,
+        // over the same 0.4 alpha.
+        #expect(abs(Int(inset[3]) - 102) <= 2, "alpha \(inset)")
+    }
+
+    @Test func fadeLengthIsLimitedToTheInset() throws {
+        let view = try Self.fadedView(alpha: 0.5, fade: 100)
+        #expect(view.frameTopInsetFade.length == Self.fadeTop)
+        #expect(view.frameTopInsetFade.opacity(above: Self.fadeTop) == 0.5)
+        view.topInsetContentAlpha = 3
+        #expect(view.frameTopInsetFade.alpha == 1)
+    }
+
+    /// Alpha 0.5 with a 6 point fade on a 32 point inset: the row whole in
+    /// the inset's upper part shows at half its ink, the row in the fade band
+    /// at more, and row 0 at full.
+    @Test func coreGraphicsFadesTheTopInset() throws {
+        let view = try Self.fadedView(alpha: 0.5, fade: 6)
+        Self.feedText(view)
+        let reference = try Self.fadedView(alpha: 1, fade: 0)
+        Self.feedText(reference)
+        let cell = view.cellDimension!
+        let top = Self.fadeTop
+        let faded = coreGraphicsPixels(view)
+        let full = coreGraphicsPixels(reference)
+        func ink(_ image: (pixels: [UInt8], width: Int), _ from: CGFloat, _ to: CGFloat) -> Double {
+            Double(Self.ink(image.pixels, width: image.width, scale: 1, channel: 0,
+                            from: from, to: to))
+        }
+        // Row 0 is untouched, pixel for pixel.
+        let rowZero = (top, top + cell.height)
+        #expect(ink(faded, rowZero.0, rowZero.1) == ink(full, rowZero.0, rowZero.1))
+        #expect(ink(full, rowZero.0, rowZero.1) > 0)
+        // Above the fade band: half.
+        let upper = ink(faded, 0, top - 6) / ink(full, 0, top - 6)
+        #expect(abs(upper - 0.5) < 0.05, "upper ratio \(upper)")
+        // In the band: between half and full.
+        let band = ink(faded, top - 6, top) / max(1, ink(full, top - 6, top))
+        #expect(band > upper + 0.02 && band < 1, "band ratio \(band)")
+    }
+
 }
 
 #if canImport(MetalKit)
@@ -450,6 +610,74 @@ struct ContentInsetsMetalTests {
         let image = try #require(metalPixels(view))
         #expect(shadeAt(x: 50, yFromTop: cell.height / 2, in: image) == .red)
     }
+
+    @Test func metalFadesTheTopInset() throws {
+        let view = try ContentInsetsTests.fadedView(alpha: 0.5, fade: 6)
+        ContentInsetsTests.feedText(view)
+        let reference = try ContentInsetsTests.fadedView(alpha: 1, fade: 0)
+        ContentInsetsTests.feedText(reference)
+        let cell = view.cellDimension!
+        let top = ContentInsetsTests.fadeTop
+        let faded = try #require(metalPixels(view))
+        let full = try #require(metalPixels(reference))
+        func ink(_ image: (pixels: [UInt8], width: Int, scale: CGFloat),
+                 _ from: CGFloat, _ to: CGFloat) -> Double {
+            Double(ContentInsetsTests.ink(image.pixels, width: image.width, scale: image.scale,
+                                          channel: 2, from: from, to: to))
+        }
+        #expect(ink(faded, top, top + cell.height) == ink(full, top, top + cell.height))
+        #expect(ink(full, top, top + cell.height) > 0)
+        let upper = ink(faded, 0, top - 6) / ink(full, 0, top - 6)
+        #expect(abs(upper - 0.5) < 0.05, "upper ratio \(upper)")
+        let band = ink(faded, top - 6, top) / max(1, ink(full, top - 6, top))
+        #expect(band > upper + 0.02 && band < 1, "band ratio \(band)")
+    }
+
+    @Test func metalFadeRampsPerPixelRow() throws {
+        let view = try ContentInsetsTests.fadedView(alpha: 0.5, fade: 6)
+        ContentInsetsTests.feedRed(view)
+        let image = try #require(metalPixels(view))
+        let scale = image.scale
+        func red(_ y: CGFloat) -> Double {
+            Double(image.pixels[(Int(y * scale) * image.width + Int(50 * scale)) * 4 + 2])
+        }
+        let full = red(ContentInsetsTests.fadeTop + 2)
+        #expect(full > 150)
+        for y: CGFloat in [2, 20, 26, 28, 29, 31] {
+            // The pixel row starting at y; its center is half a pixel lower.
+            let above = ContentInsetsTests.fadeTop - (y + 0.5 / scale)
+            let expected = ContentInsetsTests.expectedFadeRed(full: full, above: above)
+            #expect(abs(red(y) - expected) <= 4, "y \(y): \(red(y)) vs \(expected)")
+        }
+    }
+
+    @Test func metalFadesTranslucentCellBackgroundsTowardsTheDefault() throws {
+        let view = try ContentInsetsTests.fadedView(alpha: 0.5, fade: 6)
+        view.backgroundOpacity = 0.4
+        view.translucentCellBackgrounds = true
+        ContentInsetsTests.feedRed(view)
+        let image = try #require(metalPixels(view))
+        let offset = (Int(2 * image.scale) * image.width + Int(50 * image.scale)) * 4
+        let bgra = Array(image.pixels[offset..<(offset + 4)])
+        // Alpha stays the default background's 0.4; red is half of the
+        // cell's premultiplied 0.4.
+        #expect(abs(Int(bgra[3]) - 102) <= 2, "\(bgra)")
+        let fullOffset = (Int((ContentInsetsTests.fadeTop + 2) * image.scale) * image.width
+                          + Int(50 * image.scale)) * 4
+        let fullRed = Int(image.pixels[fullOffset + 2])
+        #expect(abs(Int(bgra[2]) - fullRed / 2) <= 2, "\(bgra) vs \(fullRed)")
+    }
+
+    @Test func metalFadeDefaultsDrawExactlyAsBefore() throws {
+        let plain = try ContentInsetsTests.fadedView(alpha: 1, fade: 0)
+        let unused = try ContentInsetsTests.fadedView(alpha: 1, fade: 6)
+        ContentInsetsTests.feedText(plain)
+        ContentInsetsTests.feedText(unused)
+        let a = try #require(metalPixels(plain))
+        let b = try #require(metalPixels(unused))
+        #expect(a.pixels == b.pixels)
+    }
+
 }
 #endif
 #endif

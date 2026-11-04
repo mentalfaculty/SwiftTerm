@@ -522,6 +522,32 @@ struct FrameContentInsets: Sendable, Equatable {
     }
 }
 
+/// How what is drawn inside the top content inset fades: the Mac view's
+/// `topInsetContentAlpha` and `topInsetFadeLength`. Always the identity on
+/// iOS and visionOS.
+struct FrameTopInsetFade: Sendable, Equatable {
+    /// Opacity, 0 to 1, of the content in the top inset.
+    var alpha: CGFloat = 1
+    /// Points just above row 0 over which the opacity ramps from `alpha` to 1.
+    var length: CGFloat = 0
+
+    static let identity = FrameTopInsetFade()
+
+    var isIdentity: Bool { alpha >= 1 }
+
+    /// The opacity at `above` points above row 0. The Metal shaders'
+    /// `top_inset_opacity` is the same function.
+    func opacity(above: CGFloat) -> CGFloat {
+        if alpha >= 1 || above <= 0 {
+            return 1
+        }
+        if above < length {
+            return 1 + (alpha - 1) * (above / length)
+        }
+        return alpha
+    }
+}
+
 /// The view state one frame reads, captured as a value on the main thread.
 ///
 /// Preparing a frame — refreshing the snapshot under the terminal lock and
@@ -547,6 +573,7 @@ struct FrameViewState: Sendable {
     let viewBounds: CGRect
     let viewFrameHeight: CGFloat
     let contentInsets: FrameContentInsets
+    let topInsetFade: FrameTopInsetFade
     let renderingScale: CGFloat
     let cellPixelWidth: Int
     let cellPixelHeight: Int
@@ -587,8 +614,10 @@ struct FrameViewState: Sendable {
         viewFrameHeight = view.frame.height
 #if os(macOS)
         contentInsets = view.frameContentInsets
+        topInsetFade = view.frameTopInsetFade
 #else
         contentInsets = .zero
+        topInsetFade = .identity
 #endif
 #if os(macOS)
         renderingScale = view.metalRenderingScaleFactor()
@@ -669,6 +698,8 @@ struct SnapshotRenderContext {
     /// if the grid started at the view's top-left corner and then shift the
     /// whole frame by these insets.
     let contentInsets: FrameContentInsets
+    /// How the content inside the top inset fades.
+    let topInsetFade: FrameTopInsetFade
     let renderingScale: CGFloat
     let imageScale: CGFloat
     let metalBufferingMode: MetalBufferingMode
@@ -752,6 +783,7 @@ struct SnapshotRenderContext {
         cellDimension = viewState.cellDimension
         viewBounds = viewState.viewBounds
         contentInsets = viewState.contentInsets
+        topInsetFade = viewState.topInsetFade
         renderingScale = viewState.renderingScale
         fontSmoothing = viewState.fontSmoothing
         cursorHasFocus = viewState.cursorHasFocus
@@ -3354,6 +3386,32 @@ extension TerminalView {
 
     
     // TODO: this should not render any lines outside the dirtyRect
+    #if os(macOS)
+    /// A grayscale mask, one pixel wide and as tall as the top inset in
+    /// device pixels, that gives each pixel row of the inset its opacity.
+    /// Nil when nothing fades.
+    func makeTopInsetFadeMask (fade: FrameTopInsetFade, insetHeight: CGFloat) -> CGImage?
+    {
+        guard !fade.isIdentity, insetHeight > 0 else { return nil }
+        let scale = backingScaleFactor()
+        let height = max(1, Int((insetHeight * scale).rounded()))
+        let rowHeight = insetHeight / CGFloat(height)
+        // Row 0 of the image is the view's top edge.
+        var samples = [UInt8](repeating: 0, count: height)
+        for index in 0..<height {
+            let above = insetHeight - (CGFloat(index) + 0.5) * rowHeight
+            let opacity = fade.opacity(above: above)
+            samples[index] = UInt8(max(0, min(255, (opacity * 255).rounded())))
+        }
+        guard let provider = CGDataProvider(data: Data(samples) as CFData) else { return nil }
+        return CGImage(width: 1, height: height, bitsPerComponent: 8, bitsPerPixel: 8,
+                       bytesPerRow: 1, space: CGColorSpaceCreateDeviceGray(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+    #endif
+
     func drawTerminalContents (dirtyRect: TTRect, context: CGContext, bufferOffset: Int)
     {
         // The Core Graphics draw: glyph shaping and painting from the snapshot,
@@ -3520,6 +3578,13 @@ extension TerminalView {
         // translation places glyphs, fills, images and decorations alike.
         context.saveGState()
         context.translateBy(x: insets.left, y: -insets.top)
+        // The rows above row 0 lie inside the top inset; they are drawn
+        // through this mask when they fade. In the translated space the inset
+        // spans from the view's height up.
+        let topInsetMask = makeTopInsetFadeMask(fade: renderContext.topInsetFade,
+                                                insetHeight: insets.top)
+        let topInsetRect = CGRect(x: -insets.left, y: bounds.height,
+                                  width: bounds.width, height: insets.top)
         #endif
 
         for row in firstRow...lastRow {
@@ -3529,6 +3594,18 @@ extension TerminalView {
             guard let snapshotRow = snapshot.row(atAbsolute: row) else {
                 continue
             }
+            #if os(macOS)
+            let fadesRow = row < snapshot.yDisp && topInsetMask != nil
+            if fadesRow, let topInsetMask {
+                context.saveGState()
+                context.clip(to: topInsetRect, mask: topInsetMask)
+            }
+            defer {
+                if fadesRow {
+                    context.restoreGState()
+                }
+            }
+            #endif
             let renderMode = snapshotRow.line.renderMode
             let lineOffset = calcLineOffset(forRow: row)
             let lineOrigin = CGPoint(x: 0, y: frame.height - lineOffset)
