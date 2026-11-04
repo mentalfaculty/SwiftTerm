@@ -593,12 +593,19 @@ final class TerminalRenderOwner: Sendable {
                 } else {
                     let cellHeight = request.viewState.cellDimension.height
                     let width = request.viewState.viewBounds.width
+                    let insets = request.viewState.contentInsets
+                    let gridTop = request.viewState.viewFrameHeight - insets.top
                     var dirtyRegion = CGRect(
                         x: 0,
-                        y: request.viewState.viewFrameHeight -
+                        y: gridTop -
                             (cellHeight + CGFloat(redrawEnd) * cellHeight),
                         width: width,
                         height: CGFloat(redrawEnd - redrawStart + 1) * cellHeight)
+                    if redrawStart == 0 && insets.top > 0 {
+                        // The top inset shows the scrollback just above row
+                        // 0, which moves whenever row 0 does.
+                        dirtyRegion.size.height += insets.top
+                    }
                     if redrawEnd == terminal.rows - 1 {
                         dirtyRegion = CGRect(
                             x: 0, y: 0, width: width,
@@ -740,7 +747,9 @@ final class TerminalRenderOwner: Sendable {
 
     private static func blinkRows (in snapshot: TerminalSnapshot) -> [Int] {
         var result: [Int] = []
-        for (index, row) in snapshot.rows.enumerated() {
+        // Rows in the top inset do not blink: a blink repaints screen rows.
+        for (index, row) in snapshot.rows.enumerated()
+            where index >= snapshot.rowsAboveDisplay {
             let limit = min(snapshot.cols, row.line.count)
             if (0..<limit).contains(where: {
                 row.line.packedAttribute(at: $0).style.contains(.blink)
@@ -792,7 +801,7 @@ final class TerminalRenderOwner: Sendable {
                     rowTexts: [], rowRevisions: [], cols: 0,
                     selectionActive: false, selectedRows: [])
             }
-            let texts = snapshot.rows.map { row in
+            let texts = snapshot.rows.dropFirst(snapshot.rowsAboveDisplay).map { row in
                 var result = ""
                 var column = 0
                 while column < min(snapshot.cols, row.line.count) {
@@ -804,14 +813,14 @@ final class TerminalRenderOwner: Sendable {
             }
             let selectedRows: [Int]
             if let context = snapshot.renderContext {
-                selectedRows = (snapshot.firstRow..<(snapshot.firstRow + snapshot.rowCount))
+                selectedRows = (snapshot.yDisp..<(snapshot.yDisp + snapshot.rowCount))
                     .filter { context.selection.columns(forRow: $0) != nil }
             } else {
                 selectedRows = []
             }
             return TerminalRenderSnapshotInspection(
                 rowTexts: texts,
-                rowRevisions: snapshot.rows.map(\.revision),
+                rowRevisions: snapshot.rows.dropFirst(snapshot.rowsAboveDisplay).map(\.revision),
                 cols: snapshot.cols,
                 selectionActive: snapshot.style.selectionActive,
                 selectedRows: selectedRows)

@@ -1094,6 +1094,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         if !remeasureCellDimensionIfBackingScaleChanged() {
             refreshCachedViewState()
         }
+        // The insets are rounded to the new pixel grid.
+        if frameContentInsets != appliedContentInsets {
+            contentInsetsChanged()
+        }
         frameDriver.markDirty()
     }
 
@@ -1182,7 +1186,12 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     private func updateProgressBarFrame() {
         guard let progressBarView else { return }
         let height = TerminalProgressBarView.preferredHeight
-        progressBarView.frame = CGRect(x: 0, y: bounds.height - height, width: bounds.width, height: height)
+        // Along the top of the grid, so a bar the host draws over the top
+        // inset does not hide it.
+        let insets = frameContentInsets
+        progressBarView.frame = CGRect(x: insets.left, y: bounds.height - insets.top - height,
+                                       width: max(0, bounds.width - insets.left - insets.right),
+                                       height: height)
     }
 
     /// The silence that clears a bar the application started and never
@@ -1276,7 +1285,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     
     func setupOptions ()
     {
-        setupOptions (width: getEffectiveWidth (size: bounds.size), height: bounds.height)
+        setupOptions (width: getEffectiveWidth (size: bounds.size), height: getEffectiveHeight (size: bounds.size))
         layer?.backgroundColor = nativeBackgroundColor.cgColor
     }
 
@@ -1622,8 +1631,21 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
     func getScrollerFrame() -> CGRect {
         let width = reservedScrollerWidth
-        return NSRect(x: bounds.maxX - width, y: 0, width: width, height: bounds.height)
+        let insets = frameContentInsets
+        return NSRect(x: bounds.maxX - insets.right - width, y: insets.bottom, width: width,
+                      height: max(0, bounds.height - insets.top - insets.bottom))
     }
+
+    /// The scroller's constraints that follow ``contentInsets``.
+    private var scrollerInsetConstraints: (top: NSLayoutConstraint,
+                                           bottom: NSLayoutConstraint,
+                                           trailing: NSLayoutConstraint)?
+    /// The find bar's constraints that follow ``contentInsets``.
+    private var findBarInsetConstraints: (top: NSLayoutConstraint,
+                                          leading: NSLayoutConstraint,
+                                          trailing: NSLayoutConstraint)?
+    /// The rounded insets the layout was last updated for.
+    private var appliedContentInsets = FrameContentInsets.zero
 
     func setupScroller()
     {
@@ -1644,10 +1666,17 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
 
             // Use Auto Layout to position the scroller. This ensures correct layout
             // whether the parent view uses frame-based or constraint-based layout.
+            let insets = frameContentInsets
+            let trailing = scroller.trailingAnchor.constraint(equalTo: trailingAnchor,
+                                                               constant: -insets.right)
+            let top = scroller.topAnchor.constraint(equalTo: topAnchor, constant: insets.top)
+            let bottom = scroller.bottomAnchor.constraint(equalTo: bottomAnchor,
+                                                           constant: -insets.bottom)
+            scrollerInsetConstraints = (top: top, bottom: bottom, trailing: trailing)
             NSLayoutConstraint.activate([
-                scroller.trailingAnchor.constraint(equalTo: trailingAnchor),
-                scroller.topAnchor.constraint(equalTo: topAnchor),
-                scroller.bottomAnchor.constraint(equalTo: bottomAnchor),
+                trailing,
+                top,
+                bottom,
                 scroller.widthAnchor.constraint(equalToConstant: scrollerWidth),
                 overlayScrollerIndicator.trailingAnchor.constraint(equalTo: scroller.trailingAnchor),
                 overlayScrollerIndicator.topAnchor.constraint(equalTo: scroller.topAnchor),
@@ -1729,12 +1758,97 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         let size = withTerminal { terminal in
             (cols: terminal.cols, rows: terminal.rows)
         }
-        return NSRect (x: 0, y: 0, width: cellDimension.width * CGFloat(size.cols) + reservedScrollerWidth, height: cellDimension.height * CGFloat(size.rows))
+        let insets = frameContentInsets
+        return NSRect (x: 0, y: 0, width: cellDimension.width * CGFloat(size.cols) + reservedScrollerWidth + insets.left + insets.right, height: cellDimension.height * CGFloat(size.rows) + insets.top + insets.bottom)
     }
 
+    /// The width the columns are computed from: the view's, less the
+    /// horizontal content insets and a legacy scroller.
     func getEffectiveWidth (size: CGSize) -> CGFloat
     {
-        max(0, size.width - reservedScrollerWidth)
+        let insets = frameContentInsets
+        return max(0, size.width - reservedScrollerWidth - insets.left - insets.right)
+    }
+
+    /// The height the rows are computed from: the view's, less the vertical
+    /// content insets.
+    func getEffectiveHeight (size: CGSize) -> CGFloat
+    {
+        let insets = frameContentInsets
+        return max(0, size.height - insets.top - insets.bottom)
+    }
+
+    /// Insets the terminal grid from the view's edges, the way
+    /// `NSScrollView.contentInsets` insets a document view.
+    ///
+    /// Rows and columns are computed from the bounds less these insets, and
+    /// the grid is drawn that far in from each edge, so changing them resizes
+    /// the terminal just as a frame change does. Points map to cells, and the
+    /// caret, marked text, the scroller and the find bar are placed, with the
+    /// insets taken into account.
+    ///
+    /// The top inset is meant for content to pass under: a host that lays a
+    /// translucent bar over the top of the view sets the bar's height here.
+    /// The inset then shows the scrollback lines just above the first visible
+    /// row, cut off at the view's top edge, so text scrolls up under the bar
+    /// the way a document scrolls under a window toolbar. Where there is no
+    /// scrollback, and in the other three insets, the view shows its default
+    /// background, honoring ``backgroundOpacity``.
+    ///
+    /// Mouse events in an inset go to the nearest cell. In the top inset that
+    /// is row 0 for the application (mouse reporting); a selection drag there
+    /// scrolls back, as it does at row 0.
+    ///
+    /// Values are rounded to device pixels. Negative values are treated as 0.
+    /// The default, `NSEdgeInsetsZero`, draws and behaves exactly as a view
+    /// without insets.
+    public var contentInsets: NSEdgeInsets = NSEdgeInsetsZero {
+        didSet {
+            if NSEdgeInsetsEqual(oldValue, contentInsets) {
+                return
+            }
+            contentInsetsChanged()
+        }
+    }
+
+    /// ``contentInsets``, clamped to zero and rounded to device pixels; what
+    /// layout, drawing and hit testing use.
+    var frameContentInsets: FrameContentInsets {
+        let scale = backingScaleFactor()
+        func aligned(_ value: CGFloat) -> CGFloat {
+            guard value > 0, value.isFinite else { return 0 }
+            return (value * scale).rounded() / scale
+        }
+        return FrameContentInsets(top: aligned(contentInsets.top),
+                                  left: aligned(contentInsets.left),
+                                  bottom: aligned(contentInsets.bottom),
+                                  right: aligned(contentInsets.right))
+    }
+
+    private func contentInsetsChanged() {
+        let insets = frameContentInsets
+        appliedContentInsets = insets
+        if let scrollerInsetConstraints {
+            scrollerInsetConstraints.top.constant = insets.top
+            scrollerInsetConstraints.bottom.constant = -insets.bottom
+            scrollerInsetConstraints.trailing.constant = -insets.right
+        }
+        if let findBarInsetConstraints {
+            findBarInsetConstraints.top.constant = 8 + insets.top
+            findBarInsetConstraints.leading.constant = 8 + insets.left
+            findBarInsetConstraints.trailing.constant = -8 - insets.right
+        }
+        updateProgressBarFrame()
+        guard cellDimension != nil else { return }
+        if frame.width > 0 || frame.height > 0 {
+            _ = processSizeChange(newSize: frame.size)
+        }
+        updateCursorPosition()
+        if useMetalRenderer {
+            frameDriver?.markDirty()
+        } else {
+            needsDisplay = true
+        }
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
@@ -2959,8 +3073,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         // The overlay spans the full content width. Line 1 skips the portion
         // already occupied by text to the left of the caret (e.g. the prompt)
         // via an exclusion path; wrapped lines 2+ start from the left edge.
-        let horizontalInset: CGFloat = 4
-        let rightInset: CGFloat = 4
+        let insets = frameContentInsets
+        let horizontalInset: CGFloat = 4 + insets.left
+        let rightInset: CGFloat = 4 + insets.right
         let overlayX = horizontalInset
         let overlayWidth = max(cellDimension.width, bounds.width - horizontalInset - rightInset)
         let caretX = max(horizontalInset, caretView.frame.origin.x)
@@ -3555,8 +3670,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     // NSTextInputClient protocol implementation
     open func characterIndex(for point: NSPoint) -> Int {
         let local = convert(point, from: nil)
-        let col = Int(local.x / cellDimension.width)
-        let row = Int((bounds.height - local.y) / cellDimension.height)
+        let insets = frameContentInsets
+        let col = Int((local.x - insets.left) / cellDimension.width)
+        let row = Int((bounds.height - insets.top - local.y) / cellDimension.height)
         return withTerminal { terminal in
             row * terminal.cols + col
         }
@@ -3715,10 +3831,17 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
 
         addSubview(bar)
+        let insets = frameContentInsets
+        let top = bar.topAnchor.constraint(equalTo: topAnchor, constant: 8 + insets.top)
+        let trailing = bar.trailingAnchor.constraint(equalTo: trailingAnchor,
+                                                     constant: -8 - insets.right)
+        let leading = bar.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor,
+                                                   constant: 8 + insets.left)
+        findBarInsetConstraints = (top: top, leading: leading, trailing: trailing)
         NSLayoutConstraint.activate([
-            bar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            bar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            bar.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 8),
+            top,
+            trailing,
+            leading,
             bar.widthAnchor.constraint(lessThanOrEqualToConstant: 520)
         ])
         findBar = bar
@@ -3854,6 +3977,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     func calculateMouseHitLocked (at point: CGPoint) -> (grid: Position, pixels: Position)
     {
         terminal.terminalLock.preconditionLocked()
+        // Measured from the grid's top-left corner. A point inside the top
+        // inset goes to row 0; only a point above the view (a drag) is above
+        // row 0, as it is without insets.
+        let insets = frameContentInsets
         func toInt (_ p: NSPoint) -> Position {
             let scale = backingScaleFactor()
             let width = terminalPixelCount(
@@ -3866,17 +3993,25 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 scale: scale)
             return Position(
                 col: terminalDevicePixelIndex(
-                    pointOffset: p.x - bounds.minX,
+                    pointOffset: p.x - bounds.minX - insets.left,
                     scale: scale,
                     pixelCount: width),
                 row: terminalDevicePixelIndex(
-                    pointOffset: bounds.maxY - p.y,
+                    pointOffset: bounds.maxY - insets.top - p.y,
                     scale: scale,
                     pixelCount: height))
         }
         let displayBuffer = terminal.displayBuffer
-        let col = Int (point.x / cellDimension.width)
-        let row = Int ((frame.height-point.y) / cellDimension.height)
+        let col = Int ((point.x - insets.left) / cellDimension.width)
+        var row = Int ((frame.height - insets.top - point.y) / cellDimension.height)
+        if point.y <= frame.height {
+            row = max (0, row)
+        }
+        if point.y >= 0 && point.y < insets.bottom {
+            // The bottom inset goes to the last screen row, not to the
+            // line below it, which is not on screen while scrolled back.
+            row = min (row, terminal.rows - 1)
+        }
         var colValue = min (max (0, col), terminal.cols-1)
         let bufferRow = row + displayBuffer.yDisp
         let maxRow = max (0, displayBuffer.lines.count - 1)
@@ -4419,9 +4554,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             attributes: [.font: fontSet.normal])
         // The popover anchors on the word's baseline, which lineSpacing moves.
         let baselineOffset = self.baselineOffset
+        let insets = frameContentInsets
         let baseline = NSPoint(
-            x: CGFloat(wordAndScreenRow.word.start.col) * cellDimension.width,
-            y: frame.height - CGFloat(wordAndScreenRow.screenRow + 1) * cellDimension.height
+            x: insets.left + CGFloat(wordAndScreenRow.word.start.col) * cellDimension.width,
+            y: frame.height - insets.top - CGFloat(wordAndScreenRow.screenRow + 1) * cellDimension.height
                 + baselineOffset)
         showDefinition(for: definition, at: baseline)
     }

@@ -296,7 +296,12 @@ final class TerminalSnapshot {
     private var previousBidiHostPolicy: BidiHostPolicy?
     private var previousBidiFont: ObjectIdentifier?
 
+    /// The absolute row of `rows[0]`. It is `yDisp`, less the scrollback rows
+    /// copied for the view's top inset (`rowsAboveDisplay`).
     var firstRow = 0
+    /// How many rows at the front of `rows` are above the visible screen:
+    /// scrollback that shows inside the view's top content inset.
+    var rowsAboveDisplay = 0
     var yDisp = 0
     var yBase = 0
     var x = 0
@@ -403,7 +408,10 @@ final class TerminalSnapshot {
         let bidiInputsChanged = previousBidiHostPolicy != viewState.bidiHostPolicy ||
             previousBidiFont != bidiFont
 
-        firstRow = buffer.yDisp
+        rowsAboveDisplay = min(
+            buffer.yDisp,
+            viewState.contentInsets.rowsInTopInset(cellHeight: viewState.cellDimension.height))
+        firstRow = buffer.yDisp - rowsAboveDisplay
         yDisp = buffer.yDisp
         yBase = buffer.yBase
         x = buffer.x
@@ -421,7 +429,8 @@ final class TerminalSnapshot {
         style = newStyle
         ansiColors = terminal.ansiColors
 
-        let visibleCount = max(0, min(buffer.rows, buffer.lines.count - firstRow))
+        let visibleCount = max(0, min(rowsAboveDisplay + buffer.rows,
+                                      buffer.lines.count - firstRow))
         while rows.count > visibleCount {
             rowPool.append(rows.removeLast())
         }

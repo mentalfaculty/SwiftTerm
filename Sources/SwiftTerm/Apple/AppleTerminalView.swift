@@ -501,6 +501,27 @@ struct SnapshotSelectionResolver {
     }
 }
 
+/// The space between the view's edges and the terminal grid, in points.
+///
+/// The Mac view's `contentInsets`, rounded to device pixels so that the grid
+/// keeps landing on whole pixels. Always zero on iOS and visionOS, where the
+/// scroll view's own `contentInset` does this job.
+struct FrameContentInsets: Sendable, Equatable {
+    var top: CGFloat = 0
+    var left: CGFloat = 0
+    var bottom: CGFloat = 0
+    var right: CGFloat = 0
+
+    static let zero = FrameContentInsets()
+
+    /// The rows above the first visible row that can show, whole or in part,
+    /// inside the top inset.
+    func rowsInTopInset(cellHeight: CGFloat) -> Int {
+        guard top > 0, cellHeight > 0 else { return 0 }
+        return Int(ceil(top / cellHeight))
+    }
+}
+
 /// The view state one frame reads, captured as a value on the main thread.
 ///
 /// Preparing a frame — refreshing the snapshot under the terminal lock and
@@ -525,6 +546,7 @@ struct FrameViewState: Sendable {
     let cellDimension: TerminalView.CellDimension
     let viewBounds: CGRect
     let viewFrameHeight: CGFloat
+    let contentInsets: FrameContentInsets
     let renderingScale: CGFloat
     let cellPixelWidth: Int
     let cellPixelHeight: Int
@@ -563,6 +585,11 @@ struct FrameViewState: Sendable {
         cellDimension = view.cellDimension
         viewBounds = view.bounds
         viewFrameHeight = view.frame.height
+#if os(macOS)
+        contentInsets = view.frameContentInsets
+#else
+        contentInsets = .zero
+#endif
 #if os(macOS)
         renderingScale = view.metalRenderingScaleFactor()
         fontSmoothing = view.fontSmoothing
@@ -638,6 +665,10 @@ struct SnapshotRenderContext {
     let fonts: FrameFontSet
     let cellDimension: TerminalView.CellDimension
     let viewBounds: CGRect
+    /// Where the grid sits inside `viewBounds`. Both renderers lay rows out as
+    /// if the grid started at the view's top-left corner and then shift the
+    /// whole frame by these insets.
+    let contentInsets: FrameContentInsets
     let renderingScale: CGFloat
     let imageScale: CGFloat
     let metalBufferingMode: MetalBufferingMode
@@ -720,6 +751,7 @@ struct SnapshotRenderContext {
         fonts = viewState.fonts
         cellDimension = viewState.cellDimension
         viewBounds = viewState.viewBounds
+        contentInsets = viewState.contentInsets
         renderingScale = viewState.renderingScale
         fontSmoothing = viewState.fontSmoothing
         cursorHasFocus = viewState.cursorHasFocus
@@ -1622,7 +1654,7 @@ extension TerminalView {
             // the raw frame width here would over-count by the scroller width,
             // so zooming the font in and back out would drift the column count.
             let newCols = Int(getEffectiveWidth(size: frame.size) / cellDimension.width)
-            let newRows = Int(frame.height / cellDimension.height)
+            let newRows = Int(getEffectiveHeight(size: frame.size) / cellDimension.height)
             resize(cols: newCols, rows: newRows)
         }
         updateCaretView()
@@ -1963,7 +1995,7 @@ extension TerminalView {
         if newSize.width == 0 && newSize.height == 0 {
             return
         }
-        let newRows = Int (newSize.height / cellDimension.height)
+        let newRows = Int (getEffectiveHeight (size: newSize) / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
 
         renderOwner.mailbox.queueSize(cols: newCols, rows: newRows)
@@ -1981,7 +2013,7 @@ extension TerminalView {
         if newSize.width == 0 && newSize.height == 0 {
             return false
         }
-        let newRows = Int (newSize.height / cellDimension.height)
+        let newRows = Int (getEffectiveHeight (size: newSize) / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
         let cellPixels = currentCellPixelSize()
         
@@ -3361,11 +3393,15 @@ extension TerminalView {
         let firstRow = Int(contentOffset.y / cellHeight)
         let lastRow = firstRow + Int(ceil(bounds.height / cellHeight))
         #else
-        // On Mac, we are drawing the terminal buffer
+        // On Mac, we are drawing the terminal buffer. Row 0 starts below the
+        // top inset; a dirty rect that reaches into the inset starts at a
+        // negative screen row, which is the scrollback shown there, so the
+        // division is floored rather than truncated.
         let cellHeight = cellDimension.height
-        let boundsMaxY = bounds.maxY
-        let firstRow = snapshot.yDisp+Int ((boundsMaxY-dirtyRect.maxY)/cellHeight)
-        let lastRow = snapshot.yDisp+Int((boundsMaxY-dirtyRect.minY)/cellHeight)
+        let insets = renderContext.contentInsets
+        let gridMaxY = bounds.maxY - insets.top
+        let firstRow = snapshot.yDisp+Int (floor ((gridMaxY-dirtyRect.maxY)/cellHeight))
+        let lastRow = snapshot.yDisp+Int((gridMaxY-dirtyRect.minY)/cellHeight)
         #endif
 
         let kittyRenderSnapshot = snapshot.kitty.renderSnapshot
@@ -3479,6 +3515,11 @@ extension TerminalView {
             context.setFillColor(coreGraphicsRenderCache.cgColor(for: renderContext.effectiveBackgroundColor))
             context.fill(dirtyRect)
         }
+        // Rows are laid out from the view's top-left corner; this moves them
+        // to the grid's. Everything below draws relative to its row, so one
+        // translation places glyphs, fills, images and decorations alike.
+        context.saveGState()
+        context.translateBy(x: insets.left, y: -insets.top)
         #endif
 
         for row in firstRow...lastRow {
@@ -3914,11 +3955,14 @@ extension TerminalView {
         }
         
 #if os(macOS)
+        context.restoreGState()
         // Fills gaps at the end with the default terminal background. A
         // translucent background is already there: the layer paints it (or,
         // with translucent cell backgrounds, the fill at the top of this
-        // draw), and filling it again would composite it twice.
-        let box = CGRect (x: 0, y: 0, width: bounds.width, height: bounds.height.truncatingRemainder(dividingBy: cellHeight))
+        // draw), and filling it again would composite it twice. The gap is
+        // the part of the last row that did not fit, plus the bottom inset.
+        let gridHeight = max(0, bounds.height - insets.top - insets.bottom)
+        let box = CGRect (x: 0, y: 0, width: bounds.width, height: insets.bottom + gridHeight.truncatingRemainder(dividingBy: cellHeight))
         if dirtyRect.intersects(box) && renderContext.effectiveBackgroundColor.cgColor.alpha >= 1 {
             renderContext.effectiveBackgroundColor.setFill()
             context.fill ([box])
@@ -4229,8 +4273,9 @@ extension TerminalView {
         let offset = cellDimension.height * CGFloat(cursor.absoluteRow)
         let lineOrigin = CGPoint(x: 0, y: offset)
         #else
+        let insets = frameContentInsets
         let offset = cellDimension.height * CGFloat(cursor.screenRow + 1)
-        let lineOrigin = CGPoint(x: 0, y: frame.height - offset)
+        let lineOrigin = CGPoint(x: insets.left, y: frame.height - insets.top - offset)
         #endif
         caretView.frame.origin = CGPoint(
             x: lineOrigin.x + cellDimension.width * doublePosition * CGFloat(cursor.visualCol),
