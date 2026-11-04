@@ -1814,6 +1814,57 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
+    /// The opacity, from 0 to 1, of everything the view draws inside the top
+    /// content inset: the scrollback rows above row 0 with their glyphs,
+    /// backgrounds, selection and images.
+    ///
+    /// A host that lays a translucent bar over the top inset can lower this
+    /// so the text under the bar recedes, the way content fades under a
+    /// window toolbar. The view's default background is not affected. The
+    /// default, 1, draws the inset like the rest of the view.
+    public var topInsetContentAlpha: CGFloat = 1 {
+        didSet {
+            if oldValue != topInsetContentAlpha {
+                topInsetFadeChanged()
+            }
+        }
+    }
+
+    /// The height, in points, of a band at the bottom of the top content
+    /// inset, just above row 0, over which the opacity of the content ramps
+    /// linearly from ``topInsetContentAlpha`` up to 1.
+    ///
+    /// Without it a row cut by the edge of a host's bar shows as a hard step
+    /// in opacity; with it the row fades in. Limited to the height of the top
+    /// inset. Has no effect while ``topInsetContentAlpha`` is 1. The default
+    /// is 0.
+    public var topInsetFadeLength: CGFloat = 0 {
+        didSet {
+            if oldValue != topInsetFadeLength {
+                topInsetFadeChanged()
+            }
+        }
+    }
+
+    /// ``topInsetContentAlpha`` and ``topInsetFadeLength``, clamped; what the
+    /// renderers use.
+    var frameTopInsetFade: FrameTopInsetFade {
+        let alpha = topInsetContentAlpha.isFinite ? max(0, min(1, topInsetContentAlpha)) : 1
+        let length = topInsetFadeLength.isFinite ? max(0, topInsetFadeLength) : 0
+        return FrameTopInsetFade(alpha: alpha, length: min(length, frameContentInsets.top))
+    }
+
+    private func topInsetFadeChanged() {
+        // Refreshes the snapshot, and with it the render context the Core
+        // Graphics draw reads, so the change shows without new output.
+        updateCursorPosition()
+        if useMetalRenderer {
+            frameDriver?.markDirty()
+        } else {
+            needsDisplay = true
+        }
+    }
+
     /// ``contentInsets``, clamped to zero and rounded to device pixels; what
     /// layout, drawing and hit testing use.
     var frameContentInsets: FrameContentInsets {
