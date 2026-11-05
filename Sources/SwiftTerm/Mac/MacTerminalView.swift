@@ -1051,6 +1051,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     open override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard uiShutdownState == .active else { return }
+        if window != nil {
+            updateSafeAreaContentInsets()
+        }
         frameDriver.bind(to: window == nil ? nil : self)
         hasFocus = window?.firstResponder === self
         updateTerminalFocus()
@@ -1819,10 +1822,106 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             guard value > 0, value.isFinite else { return 0 }
             return (value * scale).rounded() / scale
         }
-        return FrameContentInsets(top: aligned(contentInsets.top),
-                                  left: aligned(contentInsets.left),
-                                  bottom: aligned(contentInsets.bottom),
-                                  right: aligned(contentInsets.right))
+        guard automaticallyAdjustsContentInsets else {
+            return FrameContentInsets(top: aligned(contentInsets.top),
+                                      left: aligned(contentInsets.left),
+                                      bottom: aligned(contentInsets.bottom),
+                                      right: aligned(contentInsets.right))
+        }
+        // Each edge is the user's margin on top of the safe area, as last
+        // taken in by a layout pass.
+        let safe = adoptedSafeAreaInsets
+        func sum(_ user: CGFloat, _ safe: CGFloat) -> CGFloat {
+            let margin = user > 0 && user.isFinite ? user : 0
+            let area = safe > 0 && safe.isFinite ? safe : 0
+            return aligned(margin + area)
+        }
+        return FrameContentInsets(top: sum(contentInsets.top, safe.top),
+                                  left: sum(contentInsets.left, safe.left),
+                                  bottom: sum(contentInsets.bottom, safe.bottom),
+                                  right: sum(contentInsets.right, safe.right))
+    }
+
+    /// Whether the view adds its safe area to ``contentInsets``, the way
+    /// `NSScrollView.automaticallyAdjustsContentInsets` does.
+    ///
+    /// The safe area (`safeAreaInsets`) covers a window's title bar and
+    /// toolbar when the view lies under them, as in a window with a
+    /// full-size content view, and whatever an ancestor adds with
+    /// `additionalSafeAreaInsets`, such as a custom bar laid over the view.
+    /// When this is `true`, the grid is inset by the safe area plus
+    /// ``contentInsets`` on each edge, so the first row starts below such a
+    /// bar while scrollback passes under it; ``contentInsets`` is then the
+    /// extra margin beyond the safe area. The terminal resizes when the safe
+    /// area changes, as it does for a frame change.
+    ///
+    /// The default is `false`: the safe area is ignored.
+    public var automaticallyAdjustsContentInsets: Bool = false {
+        didSet {
+            if oldValue != automaticallyAdjustsContentInsets {
+                updateSafeAreaTracker()
+                adoptedSafeAreaInsets = safeAreaInsets
+                contentInsetsChanged()
+            }
+        }
+    }
+
+    /// An empty view pinned to `safeAreaLayoutGuide`, there while
+    /// ``automaticallyAdjustsContentInsets`` is on. AppKit has no callback for
+    /// a safe area change, and does not always lay this view out for one
+    /// (a toolbar shown or hidden, say); a constraint on the guide makes it
+    /// re-solve, and the tracker's frame change reports it.
+    private var safeAreaTracker: SafeAreaTracker?
+
+    private func updateSafeAreaTracker() {
+        if automaticallyAdjustsContentInsets {
+            guard safeAreaTracker == nil else { return }
+            let tracker = SafeAreaTracker()
+            tracker.translatesAutoresizingMaskIntoConstraints = false
+            tracker.frameChanged = { [weak self] in
+                self?.updateSafeAreaContentInsets()
+            }
+            addSubview(tracker, positioned: .below, relativeTo: nil)
+            let guide = safeAreaLayoutGuide
+            NSLayoutConstraint.activate([
+                tracker.topAnchor.constraint(equalTo: guide.topAnchor),
+                tracker.bottomAnchor.constraint(equalTo: guide.bottomAnchor),
+                tracker.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
+                tracker.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
+            ])
+            safeAreaTracker = tracker
+        } else {
+            safeAreaTracker?.removeFromSuperview()
+            safeAreaTracker = nil
+        }
+    }
+
+    /// The safe area the insets were last computed with. Read in layout
+    /// passes only, so drawing and resizing between passes agree with the
+    /// grid, and a view taken out of its window keeps its grid.
+    private var adoptedSafeAreaInsets = NSEdgeInsetsZero
+
+    /// Applies a change of the safe area. Safe area changes arrive as layout
+    /// passes, after a move to another window and after a resize.
+    private func updateSafeAreaContentInsets() {
+        guard automaticallyAdjustsContentInsets else { return }
+        let safe = safeAreaInsets
+        if NSEdgeInsetsEqual(safe, adoptedSafeAreaInsets) {
+            return
+        }
+        adoptedSafeAreaInsets = safe
+        if frameContentInsets != appliedContentInsets {
+            contentInsetsChanged()
+        }
+    }
+
+    /// Subclasses that override this must call `super`: it is where a
+    /// change of the safe area reaches ``automaticallyAdjustsContentInsets``.
+    open override func layout() {
+        // Before the constraints are solved, so the scroller and find bar
+        // move in this pass.
+        updateSafeAreaContentInsets()
+        super.layout()
     }
 
     private func contentInsetsChanged() {
@@ -5531,6 +5630,26 @@ final class DictationOverlayTextView: NSTextView {
             }
         }
     }
+}
+
+/// Follows its view's safe area through Auto Layout; see
+/// `TerminalView.safeAreaTracker`. Draws nothing and takes no events.
+final class SafeAreaTracker: NSView {
+    var frameChanged: (() -> Void)?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        frameChanged?()
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        frameChanged?()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func isAccessibilityElement() -> Bool { false }
 }
 #endif
 
