@@ -189,6 +189,23 @@ struct SafeAreaInsetsTests {
         #expect(scrollback.1 > 100 && scrollback.0 < 60, "scrollback \(scrollback)")
     }
 
+    /// The fade covers the whole combined top inset, safe area included.
+    @Test func coreGraphicsFadesTheCombinedTopInset() throws {
+        let hosted = try Self.makeHosted(safeTop: 26, adjusts: true, contentTop: 6)
+        let view = hosted.view
+        view.topInsetContentAlpha = 0.5
+        view.topInsetFadeLength = 6
+        #expect(view.frameTopInsetFade.length == 6)
+        ContentInsetsTests.feedRed(view)
+        let image = coreGraphicsPixels(view)
+        let full = Double(redGreen(image, y: 34).0)
+        let top = Double(redGreen(image, y: 2).0)
+        let band = Double(redGreen(image, y: 29).0)
+        #expect(full > 150)
+        #expect(abs(top - full * 0.5) <= 4, "top \(top) vs \(full)")
+        #expect(band > top + 10 && band < full - 10, "band \(band)")
+    }
+
     @Test func flagOffDrawsExactlyAsWithoutASafeArea() throws {
         let hosted = try Self.makeHosted(safeTop: 40, adjusts: false, contentTop: 20)
         let font = try #require(NSFont(name: "Monaco", size: 12))
@@ -251,6 +268,19 @@ struct SafeAreaInsetsMetalTests {
         #expect(rowZero.0 > 100 && rowZero.1 < 60, "row 0 \(rowZero)")
         let scrollback = redGreen(image, y: 30 - cell.height / 2)
         #expect(scrollback.1 > 100 && scrollback.0 < 60, "scrollback \(scrollback)")
+    }
+
+    @Test func metalFadesTheCombinedTopInset() throws {
+        let hosted = try SafeAreaInsetsTests.makeHosted(safeTop: 26, adjusts: true, contentTop: 6)
+        let view = hosted.view
+        view.topInsetContentAlpha = 0.5
+        view.topInsetFadeLength = 6
+        ContentInsetsTests.feedRed(view)
+        let image = try #require(metalPixels(view))
+        let full = Double(redGreen(image, y: 34).0)
+        let top = Double(redGreen(image, y: 2).0)
+        #expect(full > 150)
+        #expect(abs(top - full * 0.5) <= 4, "top \(top) vs \(full)")
     }
 }
 #endif
