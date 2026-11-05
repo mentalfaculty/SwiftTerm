@@ -4750,7 +4750,7 @@ final class MetalTerminalRenderer {
         }
     }
 
-    private static func libraryHasRequiredFunctions(_ library: MTLLibrary) -> Bool {
+    static func libraryHasRequiredFunctions(_ library: MTLLibrary) -> Bool {
         for name in requiredShaderFunctions() {
             if library.makeFunction(name: name) == nil {
                 return false
@@ -4767,7 +4767,9 @@ final class MetalTerminalRenderer {
             "terminal_text_fragment_gray",
             "terminal_color_vertex",
             "terminal_cell_color_vertex",
-            "terminal_color_fragment"
+            "terminal_color_fragment",
+            // Marks the current `viewport` layout; see Shaders.metal.
+            "swiftterm_viewport_layout_2"
         ]
     }
 

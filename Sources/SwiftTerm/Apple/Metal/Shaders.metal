@@ -125,3 +125,11 @@ vertex ColorOut terminal_cell_color_vertex(uint vid [[vertex_id]],
 fragment float4 terminal_color_fragment(ColorOut in [[stage_in]]) {
     return in.color;
 }
+
+// Never called. Its name says which uniform and buffer layout these shaders
+// use (here: `viewport` holds size and offset in one float4). The renderer
+// requires it, so a default library built from an older copy of these
+// shaders is passed over for the embedded source. When a layout changes,
+// change the number here, in `requiredShaderFunctions` (MetalTerminalRenderer)
+// and in `ContentInsetsMetalTests.aStaleShaderLibraryIsRejected`.
+kernel void swiftterm_viewport_layout_2() {}

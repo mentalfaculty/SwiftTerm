@@ -443,6 +443,34 @@ struct ContentInsetsMetalTests {
         #expect(shadeAt(x: 50, yFromTop: 30 - cell.height / 2, in: image) == .green)
     }
 
+    /// A library built from an older copy of the shaders, as an app's own
+    /// default library can be, lacks the layout marker and is passed over
+    /// for the embedded source, whose `viewport` layout the renderer feeds.
+    @Test func aStaleShaderLibraryIsRejected() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let current = try device.makeLibrary(source: swiftTermMetalShaderSource, options: nil)
+        #expect(MetalTerminalRenderer.libraryHasRequiredFunctions(current))
+
+        let marker = "kernel void swiftterm_viewport_layout_2() {}"
+        #expect(swiftTermMetalShaderSource.contains(marker))
+        let staleSource = swiftTermMetalShaderSource.replacingOccurrences(of: marker, with: "")
+        let stale = try device.makeLibrary(source: staleSource, options: nil)
+        #expect(stale.makeFunction(name: "terminal_text_vertex") != nil)
+        #expect(!MetalTerminalRenderer.libraryHasRequiredFunctions(stale))
+    }
+
+    /// The embedded copy of the shaders is kept in step with Shaders.metal
+    /// by hand; a layout change in one but not the other would be missed.
+    @Test func theEmbeddedShaderSourceMatchesShadersMetal() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let shaders = testFile.deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/SwiftTerm/Apple/Metal/Shaders.metal")
+        let file = try String(contentsOf: shaders, encoding: .utf8)
+        #expect(file.trimmingCharacters(in: .whitespacesAndNewlines) ==
+                swiftTermMetalShaderSource.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     @Test func metalWithoutInsetsDrawsRowZeroAtTheTop() throws {
         let view = try makePixelView()
         ContentInsetsTests.feedScrollback(view)
